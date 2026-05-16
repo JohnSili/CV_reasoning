@@ -47,9 +47,9 @@ PRIMITIVE_POOL = [
     ("sphere",   "gold",     [0.95, 0.80, 0.10, 1.0], [0.042, 0.042, 0.042]),
 ]
 
-TABLE_X      = (-0.22, 0.22)
-TABLE_Y      = (-0.22, 0.22)
-MIN_OBJ_DIST = 0.10
+TABLE_X      = (-0.45, 0.45)   # table is 1.5 wide, safe inner zone
+TABLE_Y      = (-0.30, 0.30)   # table is 1.0 deep
+MIN_OBJ_DIST = 0.12
 RELATION_TYPES = list(TEMPLATES.keys())
 
 
@@ -161,8 +161,8 @@ def generate(num_scenes, out_dir, seed, mode):
                 specs = make_mixed_spec(ycb_pool, rng, positions)
 
             yaw      = rng.uniform(0, 360)
-            pitch    = rng.uniform(-55, -25)
-            dist     = rng.uniform(0.9, 1.3)
+            pitch    = rng.uniform(-65, -30)   # always above table, never below
+            dist     = rng.uniform(1.0, 1.4)
 
             try:
                 rgb, objects = builder.build(specs, camera_yaw=yaw,

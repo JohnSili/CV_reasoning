@@ -11,6 +11,7 @@ import os
 import pybullet as p
 import pybullet_data
 import numpy as np
+import math
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 from PIL import Image as PILImage, ImageEnhance, ImageFilter
@@ -33,9 +34,9 @@ YCB_CATALOG = [
 ]
 
 _SPECULAR = {
-    "cube":     [0.6, 0.6, 0.6],
-    "cylinder": [0.8, 0.8, 0.8],
-    "sphere":   [1.0, 1.0, 1.0],
+    "cube":     [0.12, 0.12, 0.12],
+    "cylinder": [0.18, 0.18, 0.18],
+    "sphere":   [0.25, 0.25, 0.25],
 }
 
 
@@ -58,22 +59,84 @@ class ObjectMeta:
 def postprocess(img: np.ndarray) -> np.ndarray:
     pil = PILImage.fromarray(img)
 
-    pil = pil.filter(ImageFilter.UnsharpMask(radius=1.2, percent=140, threshold=2))
-    pil = ImageEnhance.Contrast(pil).enhance(1.15)
-    pil = ImageEnhance.Color(pil).enhance(1.20)
-    pil = ImageEnhance.Brightness(pil).enhance(1.30)   # lift overall exposure
+    # slight cinematic blur
+    pil = pil.filter(
+        ImageFilter.GaussianBlur(radius=0.35)
+    )
+
+    # soft sharpen
+    pil = pil.filter(
+        ImageFilter.UnsharpMask(
+            radius=0.8,
+            percent=70,
+            threshold=3,
+        )
+    )
+
+    # mild grading
+    pil = ImageEnhance.Contrast(pil).enhance(1.05)
+    pil = ImageEnhance.Color(pil).enhance(1.06)
+    pil = ImageEnhance.Brightness(pil).enhance(1.04)
 
     arr = np.array(pil, dtype=np.float32) / 255.0
-    arr = np.power(arr, 0.88)                          # gamma — lift midtones
 
-    # Soft vignette — gentle corner darkening only
+    # -------------------------------------------------
+    # FILMIC ACES TONEMAP
+    # -------------------------------------------------
+
+    a = 2.51
+    b = 0.03
+    c = 2.43
+    d = 0.59
+    e = 0.14
+
+    arr = np.clip(
+        (arr * (a * arr + b)) /
+        (arr * (c * arr + d) + e),
+        0,
+        1,
+    )
+
+    # slight gamma
+    arr = np.power(arr, 0.98)
+
     h, w = arr.shape[:2]
-    Y, X = np.ogrid[:h, :w]
-    dist = np.sqrt(((X - w/2) / (w/2))**2 + ((Y - h/2) / (h/2))**2)
-    vignette = 1.0 - np.clip(dist * 0.28, 0, 0.22)
-    arr *= vignette[:, :, np.newaxis]
 
-    return np.clip(arr * 255, 0, 255).astype(np.uint8)
+    # -------------------------------------------------
+    # ATMOSPHERIC HAZE
+    # -------------------------------------------------
+
+    fog = np.linspace(1.0, 0.94, h)[:, None, None]
+    arr *= fog
+
+    # -------------------------------------------------
+    # VIGNETTE
+    # -------------------------------------------------
+
+    Y, X = np.ogrid[:h, :w]
+
+    dist = np.sqrt(
+        ((X - w/2) / (w/2))**2 +
+        ((Y - h/2) / (h/2))**2
+    )
+
+    vignette = 1.0 - np.clip(dist * 0.10, 0, 0.06)
+
+    arr *= vignette[:, :, None]
+
+    # -------------------------------------------------
+    # SENSOR GRAIN
+    # -------------------------------------------------
+
+    grain = np.random.normal(0, 0.004, arr.shape)
+    arr = np.clip(arr + grain, 0, 1)
+
+    # -------------------------------------------------
+    # WOOD / TEXTURE VARIATION
+    # -------------------------------------------------
+
+    texture_noise = np.random.normal(1.0, 0.01, (h, w))
+    return (arr * 255).astype(np.uint8)
 
 
 # ------------------------------------------------------------------
@@ -81,11 +144,11 @@ def postprocess(img: np.ndarray) -> np.ndarray:
 # ------------------------------------------------------------------
 
 class SceneBuilder:
-    TABLE_HEIGHT    = 0.70
-    TABLE_THICKNESS = 0.04
-    TABLE_HALF      = 0.35
+    TABLE_HEIGHT    = 0.625  # top surface: origin z=0.6 + half thickness 0.025
+    TABLE_THICKNESS = 0.05
+    TABLE_HALF      = 0.75   # half of 1.5 scale in x
     LEG_RADIUS      = 0.025
-    SSAA            = 3      # render 1920x1440 → downsample to 640x480
+    SSAA            = 2      # render 1920x1440 → downsample to 640x480
 
     def __init__(self, width: int = 640, height: int = 480, use_gui: bool = False):
         self.width  = width
@@ -133,16 +196,69 @@ class SceneBuilder:
         p.setGravity(0, 0, -9.81)
         self._obj_counter = 0
 
-    def build(self, object_specs, camera_yaw=45.0,
-              camera_pitch=-35.0, camera_distance=1.0):
-        self.reset()
-        self._load_environment()
-        objects = self._place_objects(object_specs)
-        self._settle_physics(steps=200)
-        self._refresh_positions(objects)
-        rgb = self._render(camera_yaw, camera_pitch, camera_distance)
-        rgb = postprocess(rgb)
-        return rgb, objects
+    def build(
+        self,
+        object_specs,
+        camera_yaw=45.0,
+        camera_pitch=-35.0,
+        camera_distance=1.0,
+    ):
+        MAX_RETRIES = 5
+
+        last_error = None
+
+        for attempt in range(MAX_RETRIES):
+
+            try:
+                self.reset()
+
+                self._load_environment()
+
+                objects = self._place_objects(object_specs)
+
+                # if all objects failed
+                if len(objects) == 0:
+                    raise RuntimeError("No objects placed")
+
+                self._settle_physics(steps=200)
+
+                self._refresh_positions(objects)
+
+                rgb = self._render(
+                    camera_yaw,
+                    camera_pitch,
+                    camera_distance,
+                )
+
+                # detect broken render
+                mean_intensity = rgb.mean()
+
+                # black frame
+                if mean_intensity < 3:
+                    raise RuntimeError(
+                        f"Black frame detected ({mean_intensity:.2f})"
+                    )
+
+                # NaNs
+                if not np.isfinite(rgb).all():
+                    raise RuntimeError("NaN render detected")
+
+                rgb = postprocess(rgb)
+
+                return rgb, objects
+
+            except Exception as e:
+
+                last_error = e
+
+                print(
+                    f"[WARN] Scene build failed "
+                    f"(attempt {attempt+1}/{MAX_RETRIES}): {e}"
+                )
+
+        raise RuntimeError(
+            f"Scene generation failed after retries: {last_error}"
+        )
 
     # ------------------------------------------------------------------
     # Environment
@@ -152,44 +268,56 @@ class SceneBuilder:
         # Dark floor
         fc = p.createCollisionShape(p.GEOM_BOX, halfExtents=[4, 4, 0.01])
         fv = p.createVisualShape(p.GEOM_BOX, halfExtents=[4, 4, 0.01],
-                                  rgbaColor=[0.12, 0.12, 0.14, 1.0])
+                                  rgbaColor=[0.22, 0.22, 0.24, 1.0])
         p.createMultiBody(baseMass=0, baseCollisionShapeIndex=fc,
                           baseVisualShapeIndex=fv, basePosition=[0, 0, -0.01])
 
-        # Table surface
-        th = self.TABLE_THICKNESS / 2
-        tc = p.createCollisionShape(p.GEOM_BOX,
-                                     halfExtents=[self.TABLE_HALF, self.TABLE_HALF, th])
-        tv = p.createVisualShape(p.GEOM_BOX,
-                                  halfExtents=[self.TABLE_HALF, self.TABLE_HALF, th],
-                                  rgbaColor=[0.72, 0.52, 0.32, 1.0],
-                                  specularColor=[0.3, 0.25, 0.15])
-        p.createMultiBody(baseMass=0, baseCollisionShapeIndex=tc,
-                          baseVisualShapeIndex=tv,
-                          basePosition=[0, 0, self.TABLE_HEIGHT])
+        # Custom table URDF (table.urdf + table.obj + table.png)
+        table_urdf = os.path.join(
+            os.path.dirname(__file__), "assets", "table", "table.urdf"
+        )
+        if os.path.exists(table_urdf):
+            # Add assets dir to search path so PyBullet finds .obj and .png
+            p.setAdditionalSearchPath(
+                os.path.join(os.path.dirname(__file__), "assets", "table")
+            )
+            p.loadURDF(table_urdf, basePosition=[0, 0, 0], useFixedBase=True)
+            self._using_custom_table = True
+        else:
+            # Fallback: procedural table
+            print("[WARN] table.urdf not found in scripts/assets/table/ — using procedural table")
+            self._using_custom_table = False
+            th = self.TABLE_THICKNESS / 2
+            tc = p.createCollisionShape(p.GEOM_BOX,
+                                         halfExtents=[self.TABLE_HALF, self.TABLE_HALF, th])
+            tv = p.createVisualShape(p.GEOM_BOX,
+                                      halfExtents=[self.TABLE_HALF, self.TABLE_HALF, th],
+                                      rgbaColor=[0.72, 0.52, 0.32, 1.0],
+                                      specularColor=[0.3, 0.25, 0.15])
+            p.createMultiBody(baseMass=0, baseCollisionShapeIndex=tc,
+                              baseVisualShapeIndex=tv,
+                              basePosition=[0, 0, self.TABLE_HEIGHT])
+            lh = (self.TABLE_HEIGHT - self.TABLE_THICKNESS / 2) / 2
+            for lx, ly in [(self.TABLE_HALF-0.05,  self.TABLE_HALF-0.05),
+                            (-self.TABLE_HALF+0.05,  self.TABLE_HALF-0.05),
+                            (self.TABLE_HALF-0.05,  -self.TABLE_HALF+0.05),
+                            (-self.TABLE_HALF+0.05, -self.TABLE_HALF+0.05)]:
+                lc = p.createCollisionShape(p.GEOM_CYLINDER,
+                                             radius=self.LEG_RADIUS, height=lh * 2)
+                lv = p.createVisualShape(p.GEOM_CYLINDER,
+                                          radius=self.LEG_RADIUS, length=lh * 2,
+                                          rgbaColor=[0.52, 0.36, 0.20, 1.0])
+                p.createMultiBody(baseMass=0, baseCollisionShapeIndex=lc,
+                                  baseVisualShapeIndex=lv, basePosition=[lx, ly, lh])
 
-        # Table legs
-        lh = (self.TABLE_HEIGHT - self.TABLE_THICKNESS / 2) / 2
-        for lx, ly in [(self.TABLE_HALF-0.05,  self.TABLE_HALF-0.05),
-                        (-self.TABLE_HALF+0.05,  self.TABLE_HALF-0.05),
-                        (self.TABLE_HALF-0.05,  -self.TABLE_HALF+0.05),
-                        (-self.TABLE_HALF+0.05, -self.TABLE_HALF+0.05)]:
-            lc = p.createCollisionShape(p.GEOM_CYLINDER,
-                                         radius=self.LEG_RADIUS, height=lh * 2)
-            lv = p.createVisualShape(p.GEOM_CYLINDER,
-                                      radius=self.LEG_RADIUS, length=lh * 2,
-                                      rgbaColor=[0.52, 0.36, 0.20, 1.0])
-            p.createMultiBody(baseMass=0, baseCollisionShapeIndex=lc,
-                              baseVisualShapeIndex=lv, basePosition=[lx, ly, lh])
-
-        # Back wall — subtle depth cue
-        wc = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.6, 0.01, 0.5])
-        wv = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.6, 0.01, 0.5],
-                                  rgbaColor=[0.22, 0.22, 0.25, 1.0])
+        # Back wall
+        wc = p.createCollisionShape(p.GEOM_BOX, halfExtents=[1.5, 0.02, 1.2])
+        wv = p.createVisualShape(p.GEOM_BOX, halfExtents=[1.5, 0.02, 1.2],
+                                  rgbaColor=[0.42, 0.42, 0.45, 1.0])
         p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wc,
                           baseVisualShapeIndex=wv,
-                          basePosition=[0, self.TABLE_HALF + 0.01,
-                                        self.TABLE_HEIGHT + 0.5])
+                          basePosition=[0, self.TABLE_HALF + 0.02,
+                                        self.TABLE_HEIGHT - 0.2])
 
     # ------------------------------------------------------------------
     # Objects
@@ -237,10 +365,23 @@ class SceneBuilder:
             "clamp":            [0.60, 0.60, 0.60, 1.0],
         }
         fallback = YCB_FALLBACK_COLORS.get(spec["name"], [0.70, 0.70, 0.70, 1.0])
+
         # getVisualShapeData returns all links that have visuals — most reliable way
         for vd in p.getVisualShapeData(bid):
-            link_idx = vd[1]   # -1 = base link, 0..N = child links
-            p.changeVisualShape(bid, link_idx, rgbaColor=fallback)
+            link_idx = vd[1]
+
+            p.changeVisualShape(
+                bid,
+                link_idx,
+
+                rgbaColor=fallback,
+
+                specularColor=[0.08, 0.08, 0.08],
+
+                textureUniqueId=-1,
+            )
+
+
         obj_id = f"obj_{self._obj_counter:03d}"
         self._obj_counter += 1
         return ObjectMeta(obj_id=obj_id, bullet_id=bid,
@@ -295,51 +436,177 @@ class SceneBuilder:
     # Three-point lighting render
     # ------------------------------------------------------------------
 
-    def _render_pass(self, W, H, view, proj,
-                     light_dir, light_color, ambient, diffuse, specular):
+    def _render_pass(
+        self,
+        W,
+        H,
+        view,
+        proj,
+        light_dir,
+        light_color,
+        ambient,
+        diffuse,
+        specular,
+        shadow=True,
+    ):
+
         _, _, rgba, _, _ = p.getCameraImage(
-            width=W, height=H,
-            viewMatrix=view, projectionMatrix=proj,
+            width=W,
+            height=H,
+            viewMatrix=view,
+            projectionMatrix=proj,
+
             renderer=p.ER_TINY_RENDERER,
+
             lightDirection=light_dir,
             lightColor=light_color,
             lightDistance=3.0,
-            shadow=1,
+
+            shadow=1 if shadow else 0,
+
             lightAmbientCoeff=ambient,
             lightDiffuseCoeff=diffuse,
             lightSpecularCoeff=specular,
         )
-        return np.array(rgba, dtype=np.float32)[:, :, :3]
+
+        arr = np.array(rgba, dtype=np.float32)[:, :, :3]
+
+        # broken renderer protection
+        if arr.mean() < 1:
+            raise RuntimeError("Renderer returned black frame")
+
+        return arr
 
     def _render(self, yaw, pitch, distance):
-        W = self.width  * self.SSAA
+
+        distance = max(0.7, min(distance, 1.8))
+        pitch = max(-80, min(pitch, -10))
+
+        W = self.width * self.SSAA
         H = self.height * self.SSAA
 
         target = [0, 0, self.TABLE_HEIGHT + self.TABLE_THICKNESS / 2]
-        view = p.computeViewMatrixFromYawPitchRoll(
-            cameraTargetPosition=target, distance=distance,
-            yaw=yaw, pitch=pitch, roll=0, upAxisIndex=2)
+
+        # -------------------------------------------------
+        # RANDOMIZED CAMERA
+        # -------------------------------------------------
+
+        yaw += np.random.normal(0, 1.0)
+        pitch += np.random.normal(0, 0.8)
+        distance += np.random.normal(0, 0.025)
+
         proj = p.computeProjectionMatrixFOV(
-            fov=52, aspect=W / H, nearVal=0.01, farVal=10.0)
+            fov=44,
+            aspect=W / H,
+            nearVal=0.01,
+            farVal=10.0,
+        )
 
-        # Key light — warm, upper-front-right
-        key  = self._render_pass(W, H, view, proj,
-                                  [0.6,  0.4, 1.0], [1.00, 0.95, 0.88],
-                                  0.45, 0.85, 0.40)
-        # Fill light — cool, left, no hard shadow
-        fill = self._render_pass(W, H, view, proj,
-                                  [-0.8, 0.2, 0.6], [0.85, 0.90, 1.00],
-                                  0.65, 0.40, 0.05)
-        # Rim light — back edge separation
-        rim  = self._render_pass(W, H, view, proj,
-                                  [0.0, -1.0, 0.4], [0.95, 0.95, 1.00],
-                                  0.35, 0.25, 0.10)
+        # -------------------------------------------------
+        # TEMPORAL AA
+        # -------------------------------------------------
 
-        # Blend: 60% key + 28% fill + 12% rim
-        blended = key * 0.60 + fill * 0.28 + rim * 0.12
-        img = np.clip(blended, 0, 255).astype(np.uint8)
+        samples = []
 
-        # SSAA downsample
+        TAA_SAMPLES = 4
+
+        for _ in range(TAA_SAMPLES):
+
+            jitter_yaw = yaw + np.random.normal(0, 0.08)
+            jitter_pitch = pitch + np.random.normal(0, 0.08)
+
+            view = p.computeViewMatrixFromYawPitchRoll(
+                cameraTargetPosition=target,
+                distance=distance,
+                yaw=jitter_yaw,
+                pitch=jitter_pitch,
+                roll=0,
+                upAxisIndex=2,
+            )
+
+            # -------------------------------------------------
+            # RANDOMIZED LIGHTING
+            # -------------------------------------------------
+
+            key_strength = np.random.uniform(0.96, 1.04)
+            fill_strength = np.random.uniform(0.96, 1.04)
+
+            key = self._render_pass(
+                W,
+                H,
+                view,
+                proj,
+                light_dir=[
+                    0.55 + np.random.normal(0, 0.02),
+                    0.35 + np.random.normal(0, 0.02),
+                    0.72,
+                ],
+                light_color=[
+                    1.00 * key_strength,
+                    0.97 * key_strength,
+                    0.92 * key_strength,
+                ],
+                ambient=0.28,
+                diffuse=0.72,
+                specular=0.16,
+                shadow=True,
+            )
+
+            fill = self._render_pass(
+                W,
+                H,
+                view,
+                proj,
+                light_dir=[
+                    -0.65,
+                    0.25,
+                    0.45,
+                ],
+                light_color=[
+                    0.90 * fill_strength,
+                    0.93 * fill_strength,
+                    1.00 * fill_strength,
+                ],
+                ambient=0.22,
+                diffuse=0.28,
+                specular=0.02,
+                shadow=False,
+            )
+
+            rim = self._render_pass(
+                W,
+                H,
+                view,
+                proj,
+                light_dir=[-0.2, -1.0, 0.45],
+                light_color=[0.96, 0.96, 1.00],
+                ambient=0.05,
+                diffuse=0.18,
+                specular=0.08,
+                shadow=False,
+            )
+
+            blended = (
+                key * 0.72 +
+                fill * 0.20 +
+                rim * 0.08
+            )
+
+            samples.append(blended.astype(np.float32))
+
+        img = np.mean(samples, axis=0)
+
+        img = np.clip(img, 0, 255).astype(np.uint8)
+
+        # -------------------------------------------------
+        # SSAA DOWNSAMPLE
+        # -------------------------------------------------
+
         pil = PILImage.fromarray(img)
-        pil = pil.resize((self.width, self.height), PILImage.LANCZOS)
+
+        pil = pil.resize(
+            (self.width, self.height),
+            PILImage.LANCZOS,
+        )
+
         return np.array(pil)
